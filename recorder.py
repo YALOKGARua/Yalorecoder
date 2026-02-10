@@ -1,3 +1,4 @@
+import ctypes
 import customtkinter as ctk
 import soundfile as sf
 import numpy as np
@@ -11,7 +12,12 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
-APP_VERSION = "1.0.0"
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("yalokgar.audiorecorder.1.0")
+except Exception:
+    pass
+
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "YALOKGARua/Yalorecoder"
 
 try:
@@ -49,13 +55,58 @@ def _sanitize_filename(raw):
     return cleaned[:80] if cleaned else ''
 
 
+def _strip_silence(audio, rate, threshold_db=-40, min_gap_ms=400, pad_ms=50):
+    chunk_len = int(rate * 0.02)
+    if chunk_len == 0 or len(audio) < chunk_len:
+        return audio
+
+    threshold = 10 ** (threshold_db / 20.0)
+    n_chunks = len(audio) // chunk_len
+    pad_n = max(1, int(pad_ms / 20))
+    gap_n = max(1, int(min_gap_ms / 20))
+
+    rms_arr = np.array([
+        np.sqrt(np.mean(audio[i * chunk_len:(i + 1) * chunk_len] ** 2))
+        for i in range(n_chunks)
+    ])
+
+    voiced = rms_arr > threshold
+    expanded = voiced.copy()
+
+    for i in np.where(voiced)[0]:
+        lo = max(0, i - pad_n)
+        hi = min(len(expanded), i + pad_n + 1)
+        expanded[lo:hi] = True
+
+    silence_start = None
+    for i in range(len(expanded)):
+        if not expanded[i]:
+            if silence_start is None:
+                silence_start = i
+        else:
+            if silence_start is not None:
+                run_len = i - silence_start
+                if run_len < gap_n:
+                    expanded[silence_start:i] = True
+                silence_start = None
+
+    parts = []
+    for i in range(n_chunks):
+        if expanded[i]:
+            a = i * chunk_len
+            b = min(a + chunk_len, len(audio))
+            parts.append(audio[a:b])
+
+    return np.concatenate(parts) if parts else audio
+
+
 class AutoUpdater:
 
     API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
-    def __init__(self, on_status=None):
-        self._on_status = on_status or (lambda *a: None)
-        self._exe_path = sys.executable if getattr(sys, 'frozen', False) else None
+    def __init__(self, on_progress=None):
+        self._on_progress = on_progress or (lambda *a: None)
+        self._is_frozen = getattr(sys, 'frozen', False)
 
     def _parse_version(self, tag):
         cleaned = tag.lstrip('vV').strip()
@@ -70,84 +121,99 @@ class AutoUpdater:
         return tuple(parts[:3])
 
     def _is_newer(self, remote_tag):
-        current = self._parse_version(APP_VERSION)
-        remote = self._parse_version(remote_tag)
-        return remote > current
+        return self._parse_version(remote_tag) > self._parse_version(APP_VERSION)
 
-    def check_and_apply(self):
-        if not self._exe_path:
-            return
+    def _find_setup_asset(self, assets):
+        for asset in assets:
+            name = asset.get('name', '').lower()
+            if 'setup' in name and name.endswith('.exe'):
+                return asset
+        for asset in assets:
+            if asset.get('name', '').lower().endswith('.exe'):
+                return asset
+        return None
+
+    def run(self):
+        if not self._is_frozen:
+            return None
+
+        self._on_progress("checking", 0, "Checking for updates...")
 
         try:
             req = urllib.request.Request(self.API_URL, headers={
                 'User-Agent': f'AudioRecorder/{APP_VERSION}',
                 'Accept': 'application/vnd.github.v3+json',
             })
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
         except Exception:
-            return
+            return None
 
         tag = data.get('tag_name', '')
         if not tag or not self._is_newer(tag):
-            return
+            return None
 
-        assets = data.get('assets', [])
-        exe_asset = None
-        for asset in assets:
-            if asset.get('name', '').lower().endswith('.exe'):
-                exe_asset = asset
-                break
+        asset = self._find_setup_asset(data.get('assets', []))
+        if not asset:
+            return None
 
-        if not exe_asset:
-            return
+        download_url = asset['browser_download_url']
+        total_size = asset.get('size', 0)
+        version_clean = tag.lstrip('vV')
 
-        download_url = exe_asset['browser_download_url']
-        current_dir = os.path.dirname(self._exe_path)
-        current_name = os.path.basename(self._exe_path)
-        update_path = os.path.join(current_dir, current_name + '.update')
-        bat_path = os.path.join(current_dir, '_update.bat')
+        import tempfile
+        setup_path = os.path.join(tempfile.gettempdir(), f"AudioRecorder_Setup_v{version_clean}.exe")
 
-        self._on_status(f"Downloading v{tag.lstrip('vV')}...")
+        self._on_progress("downloading", 0, f"Downloading v{version_clean}...")
 
         try:
-            urllib.request.urlretrieve(download_url, update_path)
+            req = urllib.request.Request(download_url, headers={'User-Agent': 'AudioRecorder'})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                downloaded = 0
+                chunk_size = 65536
+                with open(setup_path, 'wb') as out_file:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            pct = min(downloaded / total_size, 1.0)
+                            mb_done = downloaded / 1048576
+                            mb_total = total_size / 1048576
+                            self._on_progress("downloading", pct,
+                                f"Downloading v{version_clean}  {mb_done:.1f}/{mb_total:.1f} MB")
         except Exception:
             try:
-                os.remove(update_path)
+                os.remove(setup_path)
             except OSError:
                 pass
-            return
+            return None
 
-        if os.path.getsize(update_path) < 500_000:
+        if total_size and os.path.getsize(setup_path) != total_size:
             try:
-                os.remove(update_path)
+                os.remove(setup_path)
             except OSError:
                 pass
-            return
+            return None
 
-        bat_content = f'''@echo off
-chcp 65001 >nul
-echo Updating Audio Recorder...
-timeout /t 2 /nobreak >nul
-move /y "{update_path}" "{self._exe_path}"
-if errorlevel 1 (
-    timeout /t 2 /nobreak >nul
-    move /y "{update_path}" "{self._exe_path}"
-)
-start "" "{self._exe_path}"
-del "%~f0"
-'''
-        with open(bat_path, 'w', encoding='utf-8') as f:
-            f.write(bat_content)
+        try:
+            with open(setup_path, 'rb') as f:
+                if f.read(2) != b'MZ':
+                    os.remove(setup_path)
+                    return None
+        except Exception:
+            return None
 
-        self._on_status("Restarting...")
-        subprocess.Popen(
-            ['cmd', '/c', bat_path],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            close_fds=True,
-        )
-        os._exit(0)
+        self._on_progress("installing", 1.0, f"Installing v{version_clean}...")
+
+        proc = subprocess.Popen([
+            setup_path, '/VERYSILENT', '/SUPPRESSMSGBOXES',
+            '/CLOSEAPPLICATIONS', '/RESTARTAPPLICATIONS',
+        ])
+        proc.wait()
+        return setup_path
 
 
 class AudioEngine:
@@ -177,6 +243,7 @@ class AudioEngine:
         self._mic_rate = 48000
         self._sys_rate = 48000
         self.last_error = None
+        self.markers = []
 
         self._mic_devices = []
         self._loopback_devices = []
@@ -250,6 +317,7 @@ class AudioEngine:
         self.is_paused = False
         self._mic_buf.clear()
         self._sys_buf.clear()
+        self.markers.clear()
         self.last_error = None
         self.mic_level = 0
         self.system_level = 0
@@ -422,6 +490,205 @@ class AudioEngine:
             return self.pause_offset
         return self.pause_offset + (time.time() - self.start_time)
 
+    def add_marker(self):
+        ts = self.elapsed()
+        idx = len(self.markers) + 1
+        self.markers.append((ts, f"Mark {idx}"))
+        return ts, idx
+
+
+class PostSaveDialog(ctk.CTkToplevel):
+
+    BG = '#05050d'
+    SURFACE = '#0a0a18'
+    BORDER = '#152035'
+    NEON = '#00e5ff'
+    PINK = '#ff2a6d'
+    GREEN = '#39ff14'
+    ORANGE = '#ff9500'
+    PURPLE = '#c050ff'
+    TEXT = '#e4e4f0'
+    DIM = '#454568'
+
+    def __init__(self, parent, audio_data, sample_rate, markers,
+                 categories, rec_name, rec_sources, duration, fmt,
+                 recordings_path, on_done):
+        super().__init__(parent)
+
+        self._audio = audio_data
+        self._rate = sample_rate
+        self._markers = list(markers)
+        self._categories = list(categories)
+        self._rec_name = rec_name
+        self._sources = rec_sources
+        self._duration = duration
+        self._fmt = fmt
+        self._base_path = recordings_path
+        self._on_done = on_done
+
+        self.title("Save Recording")
+        self.geometry("440x520")
+        self.resizable(False, False)
+        self.configure(fg_color=self.BG)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._do_discard)
+
+        if hasattr(parent, '_icon_path') and os.path.exists(parent._icon_path):
+            try:
+                self.iconbitmap(parent._icon_path)
+            except Exception:
+                pass
+
+        self.after(50, self._center_on_parent)
+        self._build_ui()
+
+    def _center_on_parent(self):
+        self.update_idletasks()
+        pw, ph = self.master.winfo_width(), self.master.winfo_height()
+        px, py = self.master.winfo_x(), self.master.winfo_y()
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 2}")
+
+    def _build_ui(self):
+        main = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=2, pady=2)
+
+        ctk.CTkLabel(
+            main, text="SAVE RECORDING",
+            font=ctk.CTkFont(size=16, weight="bold"), text_color=self.NEON
+        ).pack(anchor="w", padx=14, pady=(12, 4))
+
+        mins, secs = int(self._duration // 60), int(self._duration % 60)
+        info = f"Duration: {mins:02d}:{secs:02d}  \u2022  Markers: {len(self._markers)}"
+        ctk.CTkLabel(
+            main, text=info,
+            font=ctk.CTkFont(size=11), text_color=self.DIM
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        ctk.CTkFrame(main, fg_color=self.BORDER, height=1).pack(fill="x", padx=14, pady=4)
+
+        ctk.CTkLabel(
+            main, text="Category",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color=self.TEXT
+        ).pack(anchor="w", padx=14, pady=(8, 3))
+
+        folder_opts = ["\u2014 No category \u2014"] + self._categories
+        self._cat_var = ctk.StringVar(value=folder_opts[0])
+        self._cat_combo = ctk.CTkComboBox(
+            main, values=folder_opts, variable=self._cat_var,
+            state="readonly",
+            fg_color=self.BG, border_color=self.BORDER,
+            button_color=self.NEON, button_hover_color='#009db3',
+            dropdown_fg_color=self.SURFACE, dropdown_hover_color='#0a2535',
+            font=ctk.CTkFont(size=11)
+        )
+        self._cat_combo.pack(fill="x", padx=14, pady=(0, 6))
+
+        new_row = ctk.CTkFrame(main, fg_color="transparent")
+        new_row.pack(fill="x", padx=14, pady=(0, 8))
+
+        self._new_cat_entry = ctk.CTkEntry(
+            new_row, placeholder_text="New category name...",
+            fg_color=self.BG, border_color=self.BORDER,
+            text_color=self.TEXT, placeholder_text_color=self.DIM,
+            font=ctk.CTkFont(size=11), height=30
+        )
+        self._new_cat_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        ctk.CTkButton(
+            new_row, text="+", width=40, height=30,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=self.PURPLE, hover_color='#9535d0',
+            corner_radius=6, command=self._add_category
+        ).pack(side="right")
+
+        ctk.CTkFrame(main, fg_color=self.BORDER, height=1).pack(fill="x", padx=14, pady=4)
+
+        self._trim_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            main, text="Remove silence", variable=self._trim_var,
+            font=ctk.CTkFont(size=12),
+            fg_color=self.ORANGE, hover_color='#cc7700',
+            border_color=self.BORDER, checkmark_color='#ffffff'
+        ).pack(anchor="w", padx=14, pady=(6, 8))
+
+        if self._markers:
+            ctk.CTkFrame(main, fg_color=self.BORDER, height=1).pack(fill="x", padx=14, pady=4)
+
+            ctk.CTkLabel(
+                main, text="Markers",
+                font=ctk.CTkFont(size=12, weight="bold"), text_color=self.TEXT
+            ).pack(anchor="w", padx=14, pady=(6, 2))
+
+            mf = ctk.CTkFrame(main, fg_color=self.SURFACE, corner_radius=8)
+            mf.pack(fill="x", padx=14, pady=(0, 8))
+
+            for ts, label in self._markers:
+                m, s = int(ts // 60), int(ts % 60)
+                row = ctk.CTkFrame(mf, fg_color="transparent")
+                row.pack(fill="x", padx=8, pady=2)
+                ctk.CTkLabel(
+                    row, text=f"\u2691 {m:02d}:{s:02d}",
+                    font=ctk.CTkFont(family="Consolas", size=11),
+                    text_color=self.ORANGE
+                ).pack(side="left")
+                ctk.CTkLabel(
+                    row, text=f"  {label}",
+                    font=ctk.CTkFont(size=11), text_color=self.DIM
+                ).pack(side="left")
+
+        btn_row = ctk.CTkFrame(main, fg_color="transparent")
+        btn_row.pack(fill="x", padx=14, pady=(12, 14))
+        btn_row.grid_columnconfigure(0, weight=3)
+        btn_row.grid_columnconfigure(1, weight=2)
+
+        ctk.CTkButton(
+            btn_row, text="SAVE", height=42,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=self.GREEN, hover_color='#25d00e',
+            text_color='#000000', corner_radius=8,
+            command=self._do_save
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        ctk.CTkButton(
+            btn_row, text="DISCARD", height=42,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=self.PINK, hover_color='#d01850',
+            text_color='#ffffff', corner_radius=8,
+            command=self._do_discard
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+    def _add_category(self):
+        raw = self._new_cat_entry.get().strip()
+        if not raw:
+            return
+        name = raw[:40]
+        if name not in self._categories:
+            self._categories.append(name)
+            all_opts = ["\u2014 No category \u2014"] + self._categories
+            self._cat_combo.configure(values=all_opts)
+        self._cat_var.set(name)
+        self._new_cat_entry.delete(0, "end")
+
+    def _do_save(self):
+        cat = self._cat_var.get()
+        if cat.startswith("\u2014"):
+            cat = None
+
+        audio = self._audio
+        if self._trim_var.get():
+            audio = _strip_silence(audio, self._rate)
+
+        self._on_done("save", audio, cat, list(self._categories), self._markers)
+        self.grab_release()
+        self.destroy()
+
+    def _do_discard(self):
+        self._on_done("discard", None, None, list(self._categories), [])
+        self.grab_release()
+        self.destroy()
+
 
 class RecorderApp(ctk.CTk):
 
@@ -440,6 +707,7 @@ class RecorderApp(ctk.CTk):
     ORANGE = '#ff9500'
     TEXT = '#e4e4f0'
     TEXT_DIM = '#454568'
+    MUTED = '#6a6a8a'
     CYAN = '#00e5ff'
     MAGENTA = '#ff006e'
 
@@ -467,16 +735,25 @@ class RecorderApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
 
         if getattr(sys, 'frozen', False):
-            base = os.path.dirname(sys.executable)
+            self._bundle_dir = sys._MEIPASS
+            self._app_dir = os.path.dirname(sys.executable)
         else:
-            base = os.path.dirname(os.path.abspath(__file__))
+            self._bundle_dir = os.path.dirname(os.path.abspath(__file__))
+            self._app_dir = self._bundle_dir
 
-        icon_path = os.path.join(base, "icon.ico")
+        icon_path = os.path.join(self._bundle_dir, "icon.ico")
+        self._icon_path = icon_path
         if os.path.exists(icon_path):
             self.iconbitmap(icon_path)
-            self.after(50, lambda: self.iconbitmap(icon_path))
-        self.recordings_path = os.path.join(base, "Recordings")
+            self.iconbitmap(default=icon_path)
+            self.after(100, lambda: self._force_icon())
+        self.recordings_path = os.path.join(self._app_dir, "Recordings")
         os.makedirs(self.recordings_path, exist_ok=True)
+
+        self._config_path = os.path.join(self._app_dir, "config.json")
+        self._categories = self._load_config()
+        self._pending_markers = []
+        self._last_duration = 0
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -555,12 +832,55 @@ class RecorderApp(ctk.CTk):
         self.after(0, self._on_close)
 
     def _check_for_updates(self):
+        def _progress(stage, pct, text):
+            self.after(0, lambda: self._update_progress(stage, pct, text))
+
         def _run():
-            def _status_cb(msg):
-                self.after(0, lambda: self._show_status(msg, self.NEON))
-            updater = AutoUpdater(on_status=_status_cb)
-            updater.check_and_apply()
+            updater = AutoUpdater(on_progress=_progress)
+            result = updater.run()
+            if result is None:
+                self.after(0, lambda: self._show_status("Ready", self.TEXT_DIM))
+
         threading.Thread(target=_run, daemon=True).start()
+
+    def _update_progress(self, stage, pct, text):
+        self._show_status(text, self.NEON)
+
+        if stage == "downloading" and not hasattr(self, '_update_bar'):
+            self._update_overlay = ctk.CTkFrame(
+                self, fg_color=self.BG, corner_radius=0
+            )
+            self._update_overlay.place(relx=0, rely=1.0, relwidth=1, anchor="sw", y=-2)
+
+            self._update_bar = ctk.CTkProgressBar(
+                self._update_overlay, width=400, height=6,
+                fg_color=self.SURFACE, progress_color=self.NEON,
+                corner_radius=3,
+            )
+            self._update_bar.set(0)
+            self._update_bar.pack(fill="x", padx=16, pady=4)
+
+        if hasattr(self, '_update_bar'):
+            self._update_bar.set(pct)
+
+        if stage == "installing" and hasattr(self, '_update_bar'):
+            self._update_bar.configure(progress_color=self.GREEN, mode="indeterminate")
+            self._update_bar.start()
+
+    def _force_icon(self):
+        try:
+            self.iconbitmap(self._icon_path)
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            icon_flags = 0x00000010 | 0x00000040 | 0x00000001
+            handle = ctypes.windll.user32.LoadImageW(
+                0, self._icon_path, 1, 0, 0, icon_flags
+            )
+            if handle:
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, handle)
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, handle)
+        except Exception:
+            pass
 
     def _on_close(self):
         if self._tray_icon:
@@ -818,8 +1138,9 @@ class RecorderApp(ctk.CTk):
 
         bf = ctk.CTkFrame(parent, fg_color="transparent")
         bf.pack(fill="x", padx=16, pady=(8, 4))
-        bf.grid_columnconfigure(0, weight=3)
+        bf.grid_columnconfigure(0, weight=4)
         bf.grid_columnconfigure(1, weight=2)
+        bf.grid_columnconfigure(2, weight=2)
 
         self._rec_btn = ctk.CTkButton(
             bf, text="REC", height=48,
@@ -837,7 +1158,16 @@ class RecorderApp(ctk.CTk):
             text_color='#ffffff',
             corner_radius=10, state="disabled", command=self._on_pause
         )
-        self._pause_btn.grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        self._pause_btn.grid(row=0, column=1, sticky="ew", padx=3)
+
+        self._mark_btn = ctk.CTkButton(
+            bf, text="\u2691", height=48,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color=self.ORANGE, hover_color='#cc7700',
+            text_color='#ffffff',
+            corner_radius=10, state="disabled", command=self._on_mark
+        )
+        self._mark_btn.grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
         ctk.CTkButton(
             parent, text="Open Recordings", height=34,
@@ -943,6 +1273,7 @@ class RecorderApp(ctk.CTk):
             self._rec_btn.configure(text="STOP", fg_color=self.GREEN,
                                     hover_color=self.GREEN_DIM)
             self._pause_btn.configure(state="normal", text="PAUSE")
+            self._mark_btn.configure(text="\u2691", state="normal")
             self._name_entry.configure(state="disabled")
             self._show_status("Recording", self.PINK)
             self._timer.configure(text_color=self.PINK)
@@ -952,15 +1283,17 @@ class RecorderApp(ctk.CTk):
                 self._sys_combo.configure(state="disabled")
             self._update_tray()
         else:
-            self._show_status("Saving...", self.WARNING)
+            self._last_duration = self.engine.elapsed()
+            self._pending_markers = list(self.engine.markers)
+            self._show_status("Processing...", self.WARNING)
             self.update()
 
             audio = self.engine.stop()
-            self._save(audio)
 
             self._rec_btn.configure(text="REC", fg_color=self.PINK,
                                     hover_color=self.PINK_DIM)
             self._pause_btn.configure(state="disabled", text="PAUSE")
+            self._mark_btn.configure(text="\u2691", state="disabled")
             self._name_entry.configure(state="normal")
             self._timer.configure(text="00:00:00", text_color=self.NEON)
             if self._mic_combo:
@@ -970,6 +1303,19 @@ class RecorderApp(ctk.CTk):
             self._mic_bar.set(0)
             self._sys_bar.set(0)
             self._update_tray()
+
+            if audio is None or len(audio) == 0:
+                msg = self.engine.last_error or "No audio captured"
+                self._show_status(msg, self.DANGER)
+                return
+
+            PostSaveDialog(
+                self, audio, self.engine.sample_rate,
+                self._pending_markers, self._categories,
+                self._name_entry.get().strip(), self._rec_sources,
+                self._last_duration, self._fmt.get(),
+                self.recordings_path, self._handle_post_save
+            )
 
     def _on_pause(self):
         if not self.engine.is_recording:
@@ -986,6 +1332,14 @@ class RecorderApp(ctk.CTk):
             self._timer.configure(text_color=self.ORANGE)
         self._update_tray()
 
+    def _on_mark(self):
+        if not self.engine.is_recording:
+            return
+        ts, idx = self.engine.add_marker()
+        self._mark_btn.configure(text=f"\u2691 {idx}")
+        m, s = int(ts // 60), int(ts % 60)
+        self._show_status(f"Marker #{idx} at {m:02d}:{s:02d}", self.ORANGE)
+
     def _build_filename(self):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         ext = self._fmt.get()
@@ -997,27 +1351,77 @@ class RecorderApp(ctk.CTk):
                 return f"{safe}_{ts}.{ext}"
 
         src_tag = "+".join(self._rec_sources) if self._rec_sources else "rec"
-        duration = self.engine.elapsed()
+        duration = self._last_duration if self._last_duration > 0 else self.engine.elapsed()
         mins = int(duration // 60)
         secs = int(duration % 60)
         dur_tag = f"{mins}m{secs:02d}s" if mins > 0 else f"{secs}s"
 
         return f"recording_{ts}_{src_tag}_{dur_tag}.{ext}"
 
-    def _save(self, data):
+    def _save(self, data, category=None, markers=None):
         if data is None or len(data) == 0:
             msg = self.engine.last_error or "No audio captured"
             self._show_status(msg, self.DANGER)
             return
 
         filename = self._build_filename()
-        filepath = os.path.join(self.recordings_path, filename)
+
+        save_dir = self.recordings_path
+        if category:
+            save_dir = os.path.join(self.recordings_path, category)
+            os.makedirs(save_dir, exist_ok=True)
+
+        filepath = os.path.join(save_dir, filename)
 
         try:
             sf.write(filepath, data, self.engine.sample_rate)
-            self._show_status(f"Saved: {filename}", self.SUCCESS)
+            if markers:
+                self._write_markers(filepath, markers)
+            display = f"{category}/{filename}" if category else filename
+            self._show_status(f"Saved: {display}", self.SUCCESS)
         except Exception as e:
             self._show_status(f"Save failed: {e}", self.DANGER)
+
+    def _write_markers(self, audio_path, markers):
+        base = audio_path.rsplit('.', 1)[0]
+        marker_path = base + '.markers.txt'
+        try:
+            with open(marker_path, 'w', encoding='utf-8') as f:
+                for ts, label in markers:
+                    m = int(ts // 60)
+                    s = int(ts % 60)
+                    ms = int((ts % 1) * 1000)
+                    f.write(f"{m:02d}:{s:02d}.{ms:03d} - {label}\n")
+        except Exception:
+            pass
+
+    def _handle_post_save(self, action, audio, category, updated_cats, markers):
+        if updated_cats != self._categories:
+            self._categories = updated_cats
+            self._save_config()
+
+        if action == "discard":
+            self._show_status("Recording discarded", self.TEXT_DIM)
+            return
+
+        self._save(audio, category=category, markers=markers)
+
+    def _load_config(self):
+        default_cats = ["Химия", "Вброс предлога", "Место есть"]
+        try:
+            with open(self._config_path, 'r', encoding='utf-8') as f:
+                data = json.loads(f.read())
+                cats = data.get('categories', default_cats)
+                return cats if isinstance(cats, list) and len(cats) > 0 else default_cats
+        except Exception:
+            return list(default_cats)
+
+    def _save_config(self):
+        try:
+            with open(self._config_path, 'w', encoding='utf-8') as f:
+                json.dump({'categories': self._categories}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _open_folder(self):
         os.startfile(self.recordings_path)
