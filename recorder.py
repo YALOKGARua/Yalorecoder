@@ -17,7 +17,7 @@ try:
 except Exception:
     pass
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_REPO = "YALOKGARua/Yalorecoder"
 
 try:
@@ -534,14 +534,31 @@ class PostSaveDialog(ctk.CTkToplevel):
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._do_discard)
 
+        self._icon_file = None
         if hasattr(parent, '_icon_path') and os.path.exists(parent._icon_path):
+            self._icon_file = parent._icon_path
             try:
-                self.iconbitmap(parent._icon_path)
+                self.iconbitmap(self._icon_file)
+                self.after(80, self._apply_icon)
             except Exception:
                 pass
 
         self.after(50, self._center_on_parent)
         self._build_ui()
+
+    def _apply_icon(self):
+        if not self._icon_file:
+            return
+        try:
+            self.iconbitmap(self._icon_file)
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            flags = 0x00000010 | 0x00000040 | 0x00000001
+            handle = ctypes.windll.user32.LoadImageW(0, self._icon_file, 1, 0, 0, flags)
+            if handle:
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, handle)
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, handle)
+        except Exception:
+            pass
 
     def _center_on_parent(self):
         self.update_idletasks()
