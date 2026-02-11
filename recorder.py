@@ -1202,14 +1202,13 @@ class RecorderApp(ctk.CTk):
         footer = ctk.CTkFrame(parent, fg_color="transparent")
         footer.pack(fill="x", padx=16, pady=(0, 12))
         ctk.CTkLabel(
-            footer, text="@yalokgardev",
-            font=ctk.CTkFont(family="Consolas", size=9),
-            text_color='#252545', cursor="hand2"
+            footer, text="Bug reports & feedback:  TG @yalokgardev",
+            font=ctk.CTkFont(size=10), text_color=self.NEON_DIM
         ).pack(side="left")
         ctk.CTkLabel(
             footer, text="YALOKGAR",
             font=ctk.CTkFont(family="Consolas", size=9),
-            text_color='#252545'
+            text_color=self.PURPLE_DIM
         ).pack(side="right")
 
     def _load_devices(self):
