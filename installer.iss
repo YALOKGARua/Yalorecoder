@@ -1,5 +1,5 @@
 #define MyAppName "Audio Recorder"
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "YALOKGAR"
 #define MyAppURL "https://github.com/YALOKGARua/Yalorecoder"
 #define MyAppExeName "AudioRecorder.exe"

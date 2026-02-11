@@ -17,7 +17,7 @@ try:
 except Exception:
     pass
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 GITHUB_REPO = "YALOKGARua/Yalorecoder"
 
 try:
@@ -764,10 +764,14 @@ class RecorderApp(ctk.CTk):
             self.iconbitmap(icon_path)
             self.iconbitmap(default=icon_path)
             self.after(100, lambda: self._force_icon())
-        self.recordings_path = os.path.join(self._app_dir, "Recordings")
+        docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "AudioRecorder")
+        self.recordings_path = os.path.join(docs_dir, "Recordings")
         os.makedirs(self.recordings_path, exist_ok=True)
 
-        self._config_path = os.path.join(self._app_dir, "config.json")
+        appdata = os.environ.get('APPDATA', docs_dir)
+        config_dir = os.path.join(appdata, "AudioRecorder")
+        os.makedirs(config_dir, exist_ok=True)
+        self._config_path = os.path.join(config_dir, "config.json")
         self._categories = self._load_config()
         self._pending_markers = []
         self._last_duration = 0
@@ -1197,6 +1201,11 @@ class RecorderApp(ctk.CTk):
 
         footer = ctk.CTkFrame(parent, fg_color="transparent")
         footer.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkLabel(
+            footer, text="@yalokgardev",
+            font=ctk.CTkFont(family="Consolas", size=9),
+            text_color='#252545', cursor="hand2"
+        ).pack(side="left")
         ctk.CTkLabel(
             footer, text="YALOKGAR",
             font=ctk.CTkFont(family="Consolas", size=9),
