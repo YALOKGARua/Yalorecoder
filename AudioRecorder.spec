@@ -1,24 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
-import sys
-
 from PyInstaller.utils.hooks import collect_all
 
-py_dir = os.path.dirname(sys.executable)
+datas = [('icon.ico', '.'), ('C:\\Python314\\Lib\\site-packages\\customtkinter', 'customtkinter')]
+binaries = [('C:\\Python314\\vcruntime140.dll', '.'), ('C:\\Python314\\vcruntime140_1.dll', '.')]
+hiddenimports = ['soundfile', 'pystray._win32']
+tmp_ret = collect_all('_soundfile_data')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
-sf_datas, sf_binaries, sf_hiddenimports = collect_all('_soundfile_data')
 
 a = Analysis(
     ['recorder.py'],
     pathex=[],
-    binaries=[
-        (os.path.join(py_dir, 'vcruntime140.dll'), '.'),
-        (os.path.join(py_dir, 'vcruntime140_1.dll'), '.'),
-    ] + sf_binaries,
-    datas=[
-        ('icon.ico', '.'),
-    ] + sf_datas,
-    hiddenimports=['soundfile', 'pystray._win32'] + sf_hiddenimports,
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -26,11 +21,6 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-
-import customtkinter
-ctk_path = os.path.dirname(customtkinter.__file__)
-a.datas += Tree(ctk_path, prefix='customtkinter')
-
 pyz = PYZ(a.pure)
 
 exe = EXE(

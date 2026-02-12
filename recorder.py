@@ -38,7 +38,7 @@ def _request_elevation():
         )
     sys.exit(0)
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 GITHUB_REPO = "YALOKGARua/Yalorecoder"
 
 try:
@@ -718,16 +718,6 @@ class PostSaveDialog(ctk.CTkToplevel):
             corner_radius=6, command=self._add_category
         ).pack(side="right")
 
-        ctk.CTkFrame(main, fg_color=self.BORDER, height=1).pack(fill="x", padx=14, pady=4)
-
-        self._trim_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            main, text="Remove silence", variable=self._trim_var,
-            font=ctk.CTkFont(size=12),
-            fg_color=self.ORANGE, hover_color='#cc7700',
-            border_color=self.BORDER, checkmark_color='#ffffff'
-        ).pack(anchor="w", padx=14, pady=(6, 8))
-
         if self._markers:
             ctk.CTkFrame(main, fg_color=self.BORDER, height=1).pack(fill="x", padx=14, pady=4)
 
@@ -792,9 +782,6 @@ class PostSaveDialog(ctk.CTkToplevel):
             cat = None
 
         audio = self._audio
-        if self._trim_var.get():
-            audio = _strip_silence(audio, self._rate)
-
         self._on_done("save", audio, cat, list(self._categories), self._markers)
         self.grab_release()
         self.destroy()
@@ -1047,6 +1034,15 @@ class RecorderApp(ctk.CTk):
             row, text="AUDIO RECORDER",
             font=ctk.CTkFont(size=20, weight="bold"), text_color=self.NEON
         ).pack(side="left")
+
+        ctk.CTkButton(
+            row, text="?", width=30, height=30,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color=self.SURFACE, hover_color=self.SURFACE_ALT,
+            border_width=1, border_color=self.BORDER,
+            corner_radius=8, text_color=self.TEXT,
+            command=self._show_help
+        ).pack(side="right", padx=(6, 0))
 
         box = ctk.CTkFrame(row, fg_color="transparent")
         box.pack(side="right")
@@ -1303,7 +1299,7 @@ class RecorderApp(ctk.CTk):
             font=ctk.CTkFont(size=11), fg_color="transparent",
             hover_color=self.SURFACE_ALT, border_width=1,
             border_color=self.BORDER, corner_radius=8,
-            text_color=self.TEXT_DIM,
+            text_color='#ffffff',
             command=self._open_folder
         ).pack(fill="x", padx=16, pady=(4, 6))
 
@@ -1573,6 +1569,98 @@ class RecorderApp(ctk.CTk):
 
     def _open_folder(self):
         os.startfile(self.recordings_path)
+
+    def _show_help(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Инструкция")
+        win.geometry("460x520")
+        win.resizable(False, False)
+        win.configure(fg_color=self.BG)
+        win.transient(self)
+        win.grab_set()
+
+        if hasattr(self, '_icon_path') and os.path.exists(self._icon_path):
+            try:
+                win.iconbitmap(self._icon_path)
+            except Exception:
+                pass
+
+        win.update_idletasks()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_x(), self.winfo_y()
+        w, h = win.winfo_width(), win.winfo_height()
+        win.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 2}")
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=2, pady=2)
+
+        ctk.CTkLabel(
+            scroll, text="Инструкция",
+            font=ctk.CTkFont(size=18, weight="bold"), text_color=self.NEON
+        ).pack(anchor="w", padx=16, pady=(14, 10))
+
+        sections = [
+            ("Запись аудио", [
+                "1. Выберите микрофон и/или системный звук",
+                "2. Включите нужные источники переключателями",
+                "3. Нажмите REC для начала записи",
+                "4. Нажмите STOP для остановки",
+            ]),
+            ("Управление", [
+                "PAUSE — приостановить/возобновить запись",
+                "\u2691 — поставить маркер (закладку по времени)",
+                "Маркеры сохраняются в .markers.txt рядом с файлом",
+            ]),
+            ("Настройки звука", [
+                "Mic Volume — громкость микрофона (0-200%)",
+                "System Volume — громкость системного звука (0-200%)",
+                "Noise Gate — порог шумоподавления для микрофона",
+            ]),
+            ("Сохранение", [
+                "После остановки откроется окно сохранения",
+                "Можно выбрать категорию (папку) или создать новую",
+                "SAVE — сохранить файл, DISCARD — удалить запись",
+                "Формат: WAV (без сжатия) или FLAC (сжатие без потерь)",
+            ]),
+            ("Имя файла", [
+                "Укажите имя до начала записи или оставьте пустым",
+                "Пустое имя = автоимя: дата, источники, длительность",
+            ]),
+            ("Системный трей", [
+                "При сворачивании приложение уходит в трей",
+                "Двойной клик по иконке — вернуть окно",
+                "Правый клик — быстрое управление записью",
+            ]),
+            ("Файлы", [
+                f"Записи: Документы / AudioRecorder / Recordings",
+                "Open Recordings — открыть папку с записями",
+            ]),
+        ]
+
+        for title, lines in sections:
+            ctk.CTkLabel(
+                scroll, text=title,
+                font=ctk.CTkFont(size=13, weight="bold"), text_color=self.TEXT
+            ).pack(anchor="w", padx=16, pady=(10, 2))
+            for line in lines:
+                ctk.CTkLabel(
+                    scroll, text=line,
+                    font=ctk.CTkFont(size=11), text_color=self.MUTED,
+                    wraplength=400, justify="left"
+                ).pack(anchor="w", padx=24, pady=1)
+
+        ctk.CTkLabel(
+            scroll, text=f"v{APP_VERSION}  |  YALOKGAR",
+            font=ctk.CTkFont(size=10), text_color=self.PURPLE_DIM
+        ).pack(anchor="w", padx=16, pady=(14, 10))
+
+        ctk.CTkButton(
+            win, text="Закрыть", height=36,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color=self.NEON, hover_color=self.NEON_DIM,
+            text_color='#000000', corner_radius=8,
+            command=lambda: (win.grab_release(), win.destroy())
+        ).pack(fill="x", padx=16, pady=(0, 12))
 
     def _tick_timer(self):
         if self._closing:
