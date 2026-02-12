@@ -1036,11 +1036,11 @@ class RecorderApp(ctk.CTk):
         ).pack(side="left")
 
         ctk.CTkButton(
-            row, text="?", width=30, height=30,
-            font=ctk.CTkFont(size=14, weight="bold"),
+            row, text="Инструкция", width=90, height=28,
+            font=ctk.CTkFont(size=11),
             fg_color=self.SURFACE, hover_color=self.SURFACE_ALT,
             border_width=1, border_color=self.BORDER,
-            corner_radius=8, text_color=self.TEXT,
+            corner_radius=8, text_color=self.MUTED,
             command=self._show_help
         ).pack(side="right", padx=(6, 0))
 
