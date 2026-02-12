@@ -4,6 +4,7 @@ import soundfile as sf
 import numpy as np
 import threading
 import time
+import tempfile
 import os
 import sys
 import json
@@ -17,7 +18,27 @@ try:
 except Exception:
     pass
 
-APP_VERSION = "1.2.1"
+
+def _request_elevation():
+    if ctypes.windll.shell32.IsUserAnAdmin():
+        return
+    executable = sys.executable
+    script = os.path.abspath(sys.argv[0])
+    if getattr(sys, 'frozen', False):
+        params = ' '.join(f'"{a}"' for a in sys.argv[1:])
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+    else:
+        args = ' '.join(f'"{a}"' for a in sys.argv[1:])
+        params = f'"{script}" {args}'.strip()
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
+    if result <= 32:
+        ctypes.windll.user32.MessageBoxW(
+            0, "This application requires administrator privileges to run.",
+            "Audio Recorder", 0x10
+        )
+    sys.exit(0)
+
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "YALOKGARua/Yalorecoder"
 
 try:
@@ -50,8 +71,9 @@ def _resample(data, src_rate, dst_rate):
 
 
 def _sanitize_filename(raw):
-    allowed = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-')
-    cleaned = ''.join(c if c in allowed else '_' for c in raw).strip()
+    forbidden = set('<>:"/\\|?*\0')
+    cleaned = ''.join(c if c not in forbidden else '_' for c in raw).strip()
+    cleaned = cleaned.rstrip('.')
     return cleaned[:80] if cleaned else ''
 
 
@@ -104,8 +126,9 @@ class AutoUpdater:
 
     API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
-    def __init__(self, on_progress=None):
+    def __init__(self, on_progress=None, on_before_install=None):
         self._on_progress = on_progress or (lambda *a: None)
+        self._before_install = on_before_install or (lambda: None)
         self._is_frozen = getattr(sys, 'frozen', False)
 
     def _parse_version(self, tag):
@@ -161,7 +184,6 @@ class AutoUpdater:
         total_size = asset.get('size', 0)
         version_clean = tag.lstrip('vV')
 
-        import tempfile
         setup_path = os.path.join(tempfile.gettempdir(), f"AudioRecorder_Setup_v{version_clean}.exe")
 
         self._on_progress("downloading", 0, f"Downloading v{version_clean}...")
@@ -208,6 +230,11 @@ class AutoUpdater:
 
         self._on_progress("installing", 1.0, f"Installing v{version_clean}...")
 
+        try:
+            self._before_install()
+        except Exception:
+            pass
+
         proc = subprocess.Popen([
             setup_path, '/VERYSILENT', '/SUPPRESSMSGBOXES',
             '/CLOSEAPPLICATIONS', '/RESTARTAPPLICATIONS',
@@ -218,14 +245,17 @@ class AutoUpdater:
 
 class AudioEngine:
 
+    CHUNK = 2048
+
     def __init__(self):
         self.is_recording = False
         self.is_paused = False
         self.sample_rate = 48000
         self.channels = 2
-        self.start_time = 0
-        self.pause_offset = 0
-        self.lock = threading.Lock()
+        self._start_time = 0
+        self._pause_offset = 0
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
 
         self.capture_mic = True
         self.capture_system = True
@@ -238,8 +268,6 @@ class AudioEngine:
 
         self._mic_thread = None
         self._sys_thread = None
-        self._mic_buf = []
-        self._sys_buf = []
         self._mic_rate = 48000
         self._sys_rate = 48000
         self.last_error = None
@@ -250,18 +278,36 @@ class AudioEngine:
         self._mic_selected = None
         self._loopback_selected = None
 
+        self._mic_tmp = None
+        self._sys_tmp = None
+
         self._pa = pyaudio.PyAudio() if AUDIO_OK else None
 
     def shutdown(self):
         if self.is_recording:
+            self._stop_evt.set()
             self.is_recording = False
-            time.sleep(0.4)
+            if self._mic_thread and self._mic_thread.is_alive():
+                self._mic_thread.join(timeout=2)
+            if self._sys_thread and self._sys_thread.is_alive():
+                self._sys_thread.join(timeout=2)
         if self._pa:
             try:
                 self._pa.terminate()
             except Exception:
                 pass
             self._pa = None
+        self._cleanup_tmp()
+
+    def _cleanup_tmp(self):
+        for p in (self._mic_tmp, self._sys_tmp):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        self._mic_tmp = None
+        self._sys_tmp = None
 
     def scan_microphones(self):
         if not self._pa:
@@ -313,23 +359,30 @@ class AudioEngine:
                 return
 
     def start(self):
+        self._stop_evt.clear()
+        self._cleanup_tmp()
+
         self.is_recording = True
         self.is_paused = False
-        self._mic_buf.clear()
-        self._sys_buf.clear()
-        self.markers.clear()
         self.last_error = None
         self.mic_level = 0
         self.system_level = 0
-        self.start_time = time.time()
-        self.pause_offset = 0
+        self._start_time = time.time()
+
+        with self._lock:
+            self._pause_offset = 0
+            self.markers.clear()
 
         if self.capture_mic and self._mic_selected:
-            self._mic_thread = threading.Thread(target=self._worker_mic, daemon=True)
+            fd, self._mic_tmp = tempfile.mkstemp(suffix='.wav', prefix='arec_')
+            os.close(fd)
+            self._mic_thread = threading.Thread(target=self._capture_mic, daemon=True)
             self._mic_thread.start()
 
         if self.capture_system and self._loopback_selected:
-            self._sys_thread = threading.Thread(target=self._worker_loopback, daemon=True)
+            fd, self._sys_tmp = tempfile.mkstemp(suffix='.wav', prefix='arec_')
+            os.close(fd)
+            self._sys_thread = threading.Thread(target=self._capture_loopback, daemon=True)
             self._sys_thread.start()
 
     def _try_open_stream(self, dev, rates_to_try):
@@ -342,18 +395,17 @@ class AudioEngine:
                     rate=rate,
                     input=True,
                     input_device_index=dev['index'],
-                    frames_per_buffer=512,
+                    frames_per_buffer=self.CHUNK,
                 )
                 return stream, nch, rate
             except Exception:
                 continue
         return None, nch, 0
 
-    def _worker_mic(self):
+    def _capture_mic(self):
         dev = self._mic_selected
         native = int(dev['defaultSampleRate'])
 
-        rates = []
         if native == 48000:
             rates = [48000, 44100]
         elif native == 44100:
@@ -362,83 +414,107 @@ class AudioEngine:
             rates = [native, 48000, 44100]
 
         stream, nch, actual_rate = self._try_open_stream(dev, rates)
-        if stream is None:
+        if not stream:
             self.last_error = "Cannot open microphone"
             return
 
         self._mic_rate = actual_rate
+        writer = sf.SoundFile(
+            self._mic_tmp, mode='w', samplerate=actual_rate,
+            channels=self.channels, format='WAV', subtype='FLOAT'
+        )
+
         try:
-            while self.is_recording:
-                if self.is_paused:
-                    time.sleep(0.02)
+            while not self._stop_evt.is_set():
+                try:
+                    raw = stream.read(self.CHUNK, exception_on_overflow=False)
+                except OSError:
+                    if self._stop_evt.is_set():
+                        break
+                    time.sleep(0.003)
                     continue
 
-                try:
-                    raw = stream.read(512, exception_on_overflow=False)
-                except Exception:
+                if self.is_paused:
+                    with self._lock:
+                        self.mic_level = 0.0
                     continue
 
                 pcm = np.frombuffer(raw, dtype=np.float32).reshape(-1, nch)
                 pcm = pcm * self.mic_gain
 
-                rms = np.sqrt(np.mean(pcm ** 2))
+                if nch == 1 and self.channels == 2:
+                    pcm = np.column_stack([pcm, pcm])
+                elif nch > self.channels:
+                    pcm = pcm[:, :self.channels]
+
+                rms = float(np.sqrt(np.mean(pcm ** 2)))
 
                 if self.noise_threshold > 0 and rms < self.noise_threshold:
                     pcm = np.zeros_like(pcm)
-                    self.mic_level = max(self.mic_level * 0.5, 0)
+                    with self._lock:
+                        self.mic_level = 0.0
                 else:
-                    self.mic_level = min(rms * 8, 1.0)
+                    with self._lock:
+                        self.mic_level = min(rms * 8, 1.0)
 
-                with self.lock:
-                    if nch == 1 and self.channels == 2:
-                        pcm = np.column_stack([pcm, pcm])
-                    elif nch > self.channels:
-                        pcm = pcm[:, :self.channels]
-                    self._mic_buf.append(pcm)
+                writer.write(pcm)
         except Exception as e:
-            self.last_error = f"Mic recording: {e}"
+            self.last_error = f"Mic error: {e}"
         finally:
+            writer.close()
             try:
                 stream.stop_stream()
                 stream.close()
             except Exception:
                 pass
 
-    def _worker_loopback(self):
+    def _capture_loopback(self):
         dev = self._loopback_selected
         native = int(dev['defaultSampleRate'])
 
         stream, nch, actual_rate = self._try_open_stream(dev, [native])
-        if stream is None:
+        if not stream:
             self.last_error = "Cannot open system audio"
             return
 
         self._sys_rate = actual_rate
+        writer = sf.SoundFile(
+            self._sys_tmp, mode='w', samplerate=actual_rate,
+            channels=self.channels, format='WAV', subtype='FLOAT'
+        )
+
         try:
-            while self.is_recording:
-                if self.is_paused:
-                    time.sleep(0.02)
+            while not self._stop_evt.is_set():
+                try:
+                    raw = stream.read(self.CHUNK, exception_on_overflow=False)
+                except OSError:
+                    if self._stop_evt.is_set():
+                        break
+                    time.sleep(0.003)
                     continue
 
-                try:
-                    raw = stream.read(512, exception_on_overflow=False)
-                except Exception:
+                if self.is_paused:
+                    with self._lock:
+                        self.system_level = 0.0
                     continue
 
                 pcm = np.frombuffer(raw, dtype=np.float32).reshape(-1, nch)
                 pcm = pcm * self.system_gain
-                rms = np.sqrt(np.mean(pcm ** 2))
-                self.system_level = min(rms * 8, 1.0)
 
-                with self.lock:
-                    if nch < self.channels:
-                        pcm = np.column_stack([pcm] * self.channels)[:, :self.channels]
-                    elif nch > self.channels:
-                        pcm = pcm[:, :self.channels]
-                    self._sys_buf.append(pcm)
+                if nch < self.channels:
+                    pcm = np.column_stack([pcm] * self.channels)[:, :self.channels]
+                elif nch > self.channels:
+                    pcm = pcm[:, :self.channels]
+
+                rms = float(np.sqrt(np.mean(pcm ** 2)))
+                with self._lock:
+                    self.system_level = min(rms * 8, 1.0)
+
+                writer.write(pcm)
         except Exception as e:
-            self.last_error = f"System recording: {e}"
+            self.last_error = f"System audio error: {e}"
         finally:
+            writer.close()
             try:
                 stream.stop_stream()
                 stream.close()
@@ -447,24 +523,33 @@ class AudioEngine:
 
     def pause(self):
         if self.is_recording and not self.is_paused:
-            self.is_paused = True
-            self.pause_offset += time.time() - self.start_time
+            with self._lock:
+                self._pause_offset += time.time() - self._start_time
+                self.is_paused = True
 
     def resume(self):
         if self.is_recording and self.is_paused:
-            self.is_paused = False
-            self.start_time = time.time()
+            with self._lock:
+                self._start_time = time.time()
+                self.is_paused = False
 
     def stop(self):
+        self._stop_evt.set()
         self.is_recording = False
-        time.sleep(0.35)
 
-        with self.lock:
-            mic = np.concatenate(self._mic_buf) if self._mic_buf else None
-            sys_a = np.concatenate(self._sys_buf) if self._sys_buf else None
+        if self._mic_thread and self._mic_thread.is_alive():
+            self._mic_thread.join(timeout=3.0)
+        if self._sys_thread and self._sys_thread.is_alive():
+            self._sys_thread.join(timeout=3.0)
 
-        has_both = mic is not None and sys_a is not None
-        if has_both:
+        self._mic_thread = None
+        self._sys_thread = None
+
+        mic = self._load_audio(self._mic_tmp)
+        sys_a = self._load_audio(self._sys_tmp)
+        self._cleanup_tmp()
+
+        if mic is not None and sys_a is not None:
             if self._mic_rate != self._sys_rate:
                 mic = _resample(mic, self._mic_rate, self._sys_rate)
             self.sample_rate = self._sys_rate
@@ -483,17 +568,32 @@ class AudioEngine:
             return sys_a
         return None
 
+    def _load_audio(self, path):
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            data, rate = sf.read(path, dtype='float32')
+            if data.size == 0:
+                return None
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+            return data
+        except Exception:
+            return None
+
     def elapsed(self):
         if not self.is_recording:
             return 0.0
-        if self.is_paused:
-            return self.pause_offset
-        return self.pause_offset + (time.time() - self.start_time)
+        with self._lock:
+            if self.is_paused:
+                return self._pause_offset
+            return self._pause_offset + (time.time() - self._start_time)
 
     def add_marker(self):
         ts = self.elapsed()
-        idx = len(self.markers) + 1
-        self.markers.append((ts, f"Mark {idx}"))
+        with self._lock:
+            idx = len(self.markers) + 1
+            self.markers.append((ts, f"Mark {idx}"))
         return ts, idx
 
 
@@ -511,7 +611,7 @@ class PostSaveDialog(ctk.CTkToplevel):
     DIM = '#454568'
 
     def __init__(self, parent, audio_data, sample_rate, markers,
-                 categories, rec_name, rec_sources, duration, fmt,
+                 categories, duration, fmt,
                  recordings_path, on_done):
         super().__init__(parent)
 
@@ -519,8 +619,6 @@ class PostSaveDialog(ctk.CTkToplevel):
         self._rate = sample_rate
         self._markers = list(markers)
         self._categories = list(categories)
-        self._rec_name = rec_name
-        self._sources = rec_sources
         self._duration = duration
         self._fmt = fmt
         self._base_path = recordings_path
@@ -744,6 +842,7 @@ class RecorderApp(ctk.CTk):
         self._sys_list = []
         self._rec_sources = []
         self._tray_icon = None
+        self._closing = False
 
         self.title(f"Audio Recorder v{APP_VERSION}  |  YALOKGAR")
         self.geometry("540x780")
@@ -775,6 +874,7 @@ class RecorderApp(ctk.CTk):
         self._categories = self._load_config()
         self._pending_markers = []
         self._last_duration = 0
+        self._cached_rec_name = ""
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -854,12 +954,16 @@ class RecorderApp(ctk.CTk):
 
     def _check_for_updates(self):
         def _progress(stage, pct, text):
-            self.after(0, lambda: self._update_progress(stage, pct, text))
+            if not self._closing:
+                self.after(0, lambda: self._update_progress(stage, pct, text))
+
+        def _pre_install():
+            self.engine._cleanup_tmp()
 
         def _run():
-            updater = AutoUpdater(on_progress=_progress)
+            updater = AutoUpdater(on_progress=_progress, on_before_install=_pre_install)
             result = updater.run()
-            if result is None:
+            if result is None and not self._closing:
                 self.after(0, lambda: self._show_status("Ready", self.TEXT_DIM))
 
         threading.Thread(target=_run, daemon=True).start()
@@ -904,8 +1008,12 @@ class RecorderApp(ctk.CTk):
             pass
 
     def _on_close(self):
+        self._closing = True
         if self._tray_icon:
-            self._tray_icon.stop()
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
         self.engine.shutdown()
         self.destroy()
 
@@ -1288,6 +1396,12 @@ class RecorderApp(ctk.CTk):
                 self._show_status("Enable at least one source", self.WARNING)
                 return
 
+            mic_ready = self.engine.capture_mic and self.engine._mic_selected is not None
+            sys_ready = self.engine.capture_system and self.engine._loopback_selected is not None
+            if not mic_ready and not sys_ready:
+                self._show_status("No audio device available", self.WARNING)
+                return
+
             self._rec_sources = []
             if self.engine.capture_mic:
                 self._rec_sources.append("mic")
@@ -1310,37 +1424,47 @@ class RecorderApp(ctk.CTk):
         else:
             self._last_duration = self.engine.elapsed()
             self._pending_markers = list(self.engine.markers)
+            self._cached_rec_name = self._name_entry.get().strip()
             self._show_status("Processing...", self.WARNING)
-            self.update()
+            self._rec_btn.configure(state="disabled", text="...", fg_color=self.WARNING)
+            self._pause_btn.configure(state="disabled")
+            self._mark_btn.configure(state="disabled")
 
-            audio = self.engine.stop()
+            threading.Thread(target=self._stop_worker, daemon=True).start()
 
-            self._rec_btn.configure(text="REC", fg_color=self.PINK,
-                                    hover_color=self.PINK_DIM)
-            self._pause_btn.configure(state="disabled", text="PAUSE")
-            self._mark_btn.configure(text="\u2691", state="disabled")
-            self._name_entry.configure(state="normal")
-            self._timer.configure(text="00:00:00", text_color=self.NEON)
-            if self._mic_combo:
-                self._mic_combo.configure(state="readonly")
-            if self._sys_combo:
-                self._sys_combo.configure(state="readonly")
-            self._mic_bar.set(0)
-            self._sys_bar.set(0)
-            self._update_tray()
+    def _stop_worker(self):
+        audio = self.engine.stop()
+        if not self._closing:
+            self.after(0, lambda: self._after_stop(audio))
 
-            if audio is None or len(audio) == 0:
-                msg = self.engine.last_error or "No audio captured"
-                self._show_status(msg, self.DANGER)
-                return
+    def _after_stop(self, audio):
+        self._rec_btn.configure(
+            state="normal", text="REC",
+            fg_color=self.PINK, hover_color=self.PINK_DIM
+        )
+        self._pause_btn.configure(state="disabled", text="PAUSE")
+        self._mark_btn.configure(text="\u2691", state="disabled")
+        self._name_entry.configure(state="normal")
+        self._timer.configure(text="00:00:00", text_color=self.NEON)
+        if self._mic_combo:
+            self._mic_combo.configure(state="readonly")
+        if self._sys_combo:
+            self._sys_combo.configure(state="readonly")
+        self._mic_bar.set(0)
+        self._sys_bar.set(0)
+        self._update_tray()
 
-            PostSaveDialog(
-                self, audio, self.engine.sample_rate,
-                self._pending_markers, self._categories,
-                self._name_entry.get().strip(), self._rec_sources,
-                self._last_duration, self._fmt.get(),
-                self.recordings_path, self._handle_post_save
-            )
+        if audio is None or len(audio) == 0:
+            msg = self.engine.last_error or "No audio captured"
+            self._show_status(msg, self.DANGER)
+            return
+
+        PostSaveDialog(
+            self, audio, self.engine.sample_rate,
+            self._pending_markers, self._categories,
+            self._last_duration, self._fmt.get(),
+            self.recordings_path, self._handle_post_save
+        )
 
     def _on_pause(self):
         if not self.engine.is_recording:
@@ -1368,10 +1492,9 @@ class RecorderApp(ctk.CTk):
     def _build_filename(self):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         ext = self._fmt.get()
-        custom_name = self._name_entry.get().strip()
 
-        if custom_name:
-            safe = _sanitize_filename(custom_name)
+        if self._cached_rec_name:
+            safe = _sanitize_filename(self._cached_rec_name)
             if safe:
                 return f"{safe}_{ts}.{ext}"
 
@@ -1452,19 +1575,26 @@ class RecorderApp(ctk.CTk):
         os.startfile(self.recordings_path)
 
     def _tick_timer(self):
+        if self._closing:
+            return
         if self.engine.is_recording:
             t = self.engine.elapsed()
             h, r = divmod(int(t), 3600)
             m, s = divmod(r, 60)
             self._timer.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
-        self.after(200, self._tick_timer)
+        self.after(150, self._tick_timer)
 
     def _tick_meters(self):
+        if self._closing:
+            return
         if self.engine.is_recording and not self.engine.is_paused:
-            self._mic_bar.set(self.engine.mic_level)
-            self._sys_bar.set(self.engine.system_level)
-            self.engine.mic_level *= 0.85
-            self.engine.system_level *= 0.85
+            with self.engine._lock:
+                mic_lvl = self.engine.mic_level
+                sys_lvl = self.engine.system_level
+                self.engine.mic_level *= 0.85
+                self.engine.system_level *= 0.85
+            self._mic_bar.set(mic_lvl)
+            self._sys_bar.set(sys_lvl)
 
         if self.engine.last_error and self.engine.is_recording:
             self._show_status(self.engine.last_error, self.WARNING)
@@ -1474,6 +1604,7 @@ class RecorderApp(ctk.CTk):
 
 
 def main():
+    _request_elevation()
     app = RecorderApp()
     app.mainloop()
 

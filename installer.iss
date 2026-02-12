@@ -1,5 +1,5 @@
 #define MyAppName "Audio Recorder"
-#define MyAppVersion "1.2.1"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "YALOKGAR"
 #define MyAppURL "https://github.com/YALOKGARua/Yalorecoder"
 #define MyAppExeName "AudioRecorder.exe"
@@ -21,7 +21,7 @@ UninstallDisplayIcon={app}\AudioRecorder.exe
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 CloseApplications=force
 RestartApplications=yes
@@ -37,7 +37,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "dist\AudioRecorder.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "icon.png"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"
