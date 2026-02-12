@@ -38,7 +38,7 @@ def _request_elevation():
         )
     sys.exit(0)
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 GITHUB_REPO = "YALOKGARua/Yalorecoder"
 
 try:
@@ -130,6 +130,7 @@ class AutoUpdater:
         self._on_progress = on_progress or (lambda *a: None)
         self._before_install = on_before_install or (lambda: None)
         self._is_frozen = getattr(sys, 'frozen', False)
+        self.last_error = None
 
     def _parse_version(self, tag):
         cleaned = tag.lstrip('vV').strip()
@@ -158,6 +159,7 @@ class AutoUpdater:
 
     def run(self):
         if not self._is_frozen:
+            self.last_error = "skip: not frozen"
             return None
 
         self._on_progress("checking", 0, "Checking for updates...")
@@ -169,15 +171,21 @@ class AutoUpdater:
             })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
-        except Exception:
+        except Exception as e:
+            self.last_error = f"API error: {e}"
             return None
 
         tag = data.get('tag_name', '')
-        if not tag or not self._is_newer(tag):
+        if not tag:
+            self.last_error = "no tag in release"
+            return None
+        if not self._is_newer(tag):
+            self.last_error = f"up to date ({APP_VERSION} >= {tag})"
             return None
 
         asset = self._find_setup_asset(data.get('assets', []))
         if not asset:
+            self.last_error = "no setup exe in release assets"
             return None
 
         download_url = asset['browser_download_url']
@@ -190,7 +198,7 @@ class AutoUpdater:
 
         try:
             req = urllib.request.Request(download_url, headers={'User-Agent': 'AudioRecorder'})
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with urllib.request.urlopen(req, timeout=120) as response:
                 downloaded = 0
                 chunk_size = 65536
                 with open(setup_path, 'wb') as out_file:
@@ -206,7 +214,8 @@ class AutoUpdater:
                             mb_total = total_size / 1048576
                             self._on_progress("downloading", pct,
                                 f"Downloading v{version_clean}  {mb_done:.1f}/{mb_total:.1f} MB")
-        except Exception:
+        except Exception as e:
+            self.last_error = f"download failed: {e}"
             try:
                 os.remove(setup_path)
             except OSError:
@@ -214,6 +223,7 @@ class AutoUpdater:
             return None
 
         if total_size and os.path.getsize(setup_path) != total_size:
+            self.last_error = "file size mismatch"
             try:
                 os.remove(setup_path)
             except OSError:
@@ -223,9 +233,11 @@ class AutoUpdater:
         try:
             with open(setup_path, 'rb') as f:
                 if f.read(2) != b'MZ':
+                    self.last_error = "downloaded file is not a valid exe"
                     os.remove(setup_path)
                     return None
-        except Exception:
+        except Exception as e:
+            self.last_error = f"verify failed: {e}"
             return None
 
         self._on_progress("installing", 1.0, f"Installing v{version_clean}...")
@@ -235,12 +247,12 @@ class AutoUpdater:
         except Exception:
             pass
 
-        proc = subprocess.Popen([
+        subprocess.Popen([
             setup_path, '/VERYSILENT', '/SUPPRESSMSGBOXES',
             '/CLOSEAPPLICATIONS', '/RESTARTAPPLICATIONS',
         ])
-        proc.wait()
-        return setup_path
+        time.sleep(1)
+        os._exit(0)
 
 
 class AudioEngine:
@@ -945,7 +957,12 @@ class RecorderApp(ctk.CTk):
                 self.after(0, lambda: self._update_progress(stage, pct, text))
 
         def _pre_install():
-            self.engine._cleanup_tmp()
+            self.engine.shutdown()
+            if self._tray_icon:
+                try:
+                    self._tray_icon.stop()
+                except Exception:
+                    pass
 
         def _run():
             updater = AutoUpdater(on_progress=_progress, on_before_install=_pre_install)
